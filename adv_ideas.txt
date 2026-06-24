@@ -1,0 +1,4 @@
+advance ideas to study later: 
+bpe 
+positional embeddings optimizing during training
+
