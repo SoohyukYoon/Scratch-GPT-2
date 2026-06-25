@@ -1,6 +1,6 @@
 GPT_CONFIG_124M = { 
     "vocab_size": 50257, 
-    "context_length": 1024, 
+    "context_length": 256, 
     "emb_dim": 768, 
     "n_heads": 12, 
     "n_layers": 12, 
@@ -113,7 +113,105 @@ class TransformerBlock(nn.Module):
 
         return x 
 
-def main(): 
+# Helpers
+def generate(model, idx, max_new_tokens, context_size, temperature=1.0, top_k=None, eos_id=None): 
+    for _ in range(max_new_tokens): 
+        data = idx[:,-context_size:]
+        with torch.no_grad(): # No gradient calculation---more efficient
+            logits = model(data)
+        logits = logits[:,-1,:]
+        if top_k is not None:
+            top_logits, top_pos = torch.top_k(logits, top_k)
+            updated_logits = torch.where(
+                condition=new_idx < top_logits[-1], 
+                input=float('-inf'), 
+                other=logits
+            )
+        assert temperature > 0., "Temperature value is negative"
+        probs = torch.softmax(logits / temperature, dim=-1)
+        new_idx = torch.multinomial(probs, num_samples=1)
+        if new_idx.item() == eos_id:
+            break
+        idx = torch.cat((idx, new_idx), dim=1)
+
+    return idx 
+
+def text_to_token_ids(text, tokenizer): 
+    token_ids = tokenizer.encode(text, allowed_special={'<|endoftext|>'})
+    token_ids = torch.tensor(token_ids).unsqueeze(0) 
+    return token_ids
+
+def token_ids_to_text(token_ids, tokenizer): 
+    flat = token_ids.squeeze(0)
+    text = tokenizer.decode(flat.tolist())
+    return text 
+
+def calc_loss_batch(input_batch, target_batch, model, device): 
+    input_batch = input_batch.to(device)
+    target_batch = target_batch.to(device)
+    logits = model(input_batch)
+    # Input dimension: ([batch, seq_len, vocab_size], [batch, seq_len]) 
+    # Operation: At seq i, fetch target token prob via logits[b, seq, target_batc[seq]]
+    loss = torch.nn.functional.cross_entropy(logits.flatten(0,1), target_batch.flatten())
+    return loss 
+
+def calc_loss_loader(data_loader, model, device, num_batches=None): 
+    '''
+    Function is yo *log* loss of our dataset, not actually use for backprop, since we are finding the average loss of total dataet. 
+    Critique: if num_batches < len(data_loader) for efficiency in eval, current function always ignores data_loader[num_batches:] always, not representative, so should shuffle instead in real practice. 
+    '''
+    total_loss = 0. 
+    if len(data_loader) == 0: 
+        return float("nan")
+    elif num_batches is None: 
+        num_batches = len(data_loader)
+    else:
+        num_batches = min(num_batches, len(data_loader))
+    
+    for i, (input_batch, target_batch) in enumerate(data_loader): 
+        if i < num_batches: 
+            loss = calc_loss_batch(input_batch, target_batch, model, device)
+            total_loss += loss.item()
+        else: 
+            break 
+    
+    return total_loss / num_batches 
+    
+# Main
+def main():
+    # Data Ready 
+    from embeddings import create_dataloader_v1
+    with open("the-verdict.txt", "r", encoding='utf-8') as file:
+        text_data = file.read()
+
+    training_ratio = 0.9
+    split = int(training_ratio * len(text_data))
+    train_data = text_data[:split]
+    val_data = text_data[split:]
+
+    train_loader = create_dataloader_v1(txt=train_data, batch_size=2, max_length=GPT_CONFIG_124M["context_length"], stride=GPT_CONFIG_124M["context_length"], drop_last=True, shuffle=True, num_workers=0)
+    val_loader = create_dataloader_v1(txt=val_data, batch_size=2, max_length=GPT_CONFIG_124M["context_length"], stride=GPT_CONFIG_124M["context_length"], drop_last=False, shuffle=False, num_workers=0)
+
+    print("Train loader:")
+    for x, y in train_loader:
+        print(x.shape, y.shape)
+    print("\nValidation loader:")
+    for x, y in val_loader:
+        print(x.shape, y.shape)
+
+    # Model Ready 
+    torch.manual_seed(123)
+    model = GPTModel(GPT_CONFIG_124M)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    with torch.no_grad(): 
+        train_loss = calc_loss_loader(train_loader, model, device)
+        val_loss = calc_loss_loader(val_loader, model, device)
+    
+    print("Training loss: ", train_loss)
+    print("Validation loss: ", val_loss)
+
+def main_old(): 
     import tiktoken 
     tokenizer = tiktoken.get_encoding("gpt2")
     batch = [] 
@@ -131,32 +229,17 @@ def main():
     model = GPTModel(GPT_CONFIG_124M)
     
     start_context = "Hello, I am "
-    idx = tokenizer.encode(start_context)
-    idx_tensor = torch.tensor(idx).unsqueeze(0) # Adds a batch dimension (1, token, emb_dim)
-    
+  
     model.eval()
-    out = generate_text_simple(model=model,
-                               idx=idx_tensor, 
+    out = generate(model=model,
+                               idx=text_to_token_ids(start_context, tokenizer), 
                                max_new_tokens=5, 
                                context_size=GPT_CONFIG_124M['context_length']
                             )   
     print("Output: ", out)
     print("Output Lenght: ", len(out[0]))
 
-    decoded_out = tokenizer.decode(out.squeeze(0).tolist())
-    print(decoded_out)
-
-def generate_text_simple(model, idx, max_new_tokens, context_size): 
-    for _ in range(max_new_tokens): 
-        data = idx[:,-context_size:]
-        with torch.no_grad(): # No gradient calculation---more efficient
-            logits = model(data)
-        logits = logits[:,-1,:]
-        probs = torch.softmax(logits, dim=-1)
-        new_idx = torch.argmax(probs, dim=-1, keepdim=True)
-        idx = torch.cat((idx, new_idx), dim=1)
-
-    return idx 
+    print(token_ids_to_text(out, tokenizer))
 
 if __name__=="__main__": 
     main()
